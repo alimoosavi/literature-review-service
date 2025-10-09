@@ -1,0 +1,5 @@
+Django
+requests
+PyMuPDF
+pdfminer.six
+openai
