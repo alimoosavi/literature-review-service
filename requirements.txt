@@ -3,3 +3,11 @@ requests
 PyMuPDF
 pdfminer.six
 openai
+djangorestframework
+djangorestframework-simplejwt
+python-dotenv
+psycopg2-binary
+celery
+celery[redis]
+redis
+pyalex
