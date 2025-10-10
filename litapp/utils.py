@@ -81,7 +81,7 @@ def fetch_openalex_works_data(topic: str, per_page: int = 30) -> list:
         'filter': 'is_oa:true,type:journal-article',  # Only Open Access journal articles
         'sort': 'cited_by_count:desc',  # Highest cited first
         'per-page': per_page,
-        'mailto': settings.DEFAULT_MAILTO  # Polite pool email
+        'mailto': settings.OPENALEX_DEFAULT_MAILTO  # Polite pool email
     }
 
     headers = {
