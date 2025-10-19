@@ -10,4 +10,7 @@ psycopg2-binary
 celery
 celery[redis]
 redis
+django-redis
 pyalex
+openai
+django-cors-headers

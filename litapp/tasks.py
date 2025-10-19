@@ -1,51 +1,52 @@
 import logging
 import os
+from typing import List
 
 from celery import shared_task
 from django.conf import settings
-from django.db import transaction  # Important for atomic updates
+from django.db import transaction
+from django.utils import timezone
 
 from litapp.models import Paper, LiteratureReviewJob, LiteratureReview
-# Import utility functions for API calls and file handling
-from litapp.utils import download_pdf, extract_text_from_pdf, fetch_openalex_works_data
+from litapp.utils import (
+    download_pdf,
+    extract_text_from_pdf,
+    fetch_openalex_works_data,
+)
+
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
+client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
-# --- Helper Functions ---
+# ---------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------
+
 
 def create_or_update_paper(paper_data: dict) -> Paper:
     """
-    Creates or updates a Paper object using raw JSON data received from the
-    OpenAlex API works endpoint.
+    Creates or updates a Paper instance from OpenAlex metadata.
     """
-    # Safely extract all required fields from the raw API response (dict)
     openalex_id = paper_data.get("id")
     title = paper_data.get("display_name")
     year = paper_data.get("publication_year")
     doi = paper_data.get("doi")
 
-    # Extract authors, handling the nested list structure
+    if not openalex_id or not title or not year:
+        raise ValueError("Missing required fields (ID, Title, or Year) in paper data.")
+
     authors_list = [
         a.get("author", {}).get("display_name")
         for a in paper_data.get("authorships", [])
         if a.get("author", {}).get("display_name")
     ]
     authors = ", ".join(authors_list)
-
-    # The permanent URL for the OpenAlex work page
     url = openalex_id
-
-    # Find the best Open Access PDF location
     best_oa_location = paper_data.get("open_access", {}).get("best_oa_location")
     pdf_url = best_oa_location.get("pdf_url") if best_oa_location else None
 
-    # Check for mandatory fields before creating/updating
-    if not openalex_id or not title or not year:
-        # Log and raise an error for papers missing critical metadata
-        raise ValueError("Missing required fields (ID, Title, or Year) in paper data.")
-
-    # Create or update the paper record atomically
     paper, created = Paper.objects.get_or_create(
         openalex_id=openalex_id,
         defaults={
@@ -55,162 +56,239 @@ def create_or_update_paper(paper_data: dict) -> Paper:
             "doi": doi,
             "url": url,
             "pdf_url": pdf_url,
-        }
+        },
     )
+
+    if not created:
+        updated = False
+        for field, value in [
+            ("title", title),
+            ("authors", authors),
+            ("year", year),
+            ("doi", doi),
+            ("url", url),
+            ("pdf_url", pdf_url),
+        ]:
+            if getattr(paper, field) != value:
+                setattr(paper, field, value)
+                updated = True
+        if updated:
+            paper.save()
+
     return paper
 
 
-def process_pdf_and_extract_text(paper: Paper):
+def process_pdf_and_extract_text(paper: Paper) -> bool:
     """
-    Downloads the PDF if a URL is present and no text has been extracted yet.
-    Caches the file locally and extracts the full text.
+    Downloads a paper’s PDF, extracts text, and updates the Paper model.
+    Returns True if successful.
     """
-    if paper.pdf_url and not paper.text:
-        # download_pdf returns the absolute path to the cached PDF
-        pdf_path = download_pdf(paper.pdf_url, openalex_id=paper.openalex_id)
+    if not paper.pdf_url:
+        return False
 
-        if pdf_path:
-            # 1. Extract text
-            paper.text = extract_text_from_pdf(pdf_path)
+    if paper.text and paper.cached_file:
+        return True  # already processed
 
-            # 2. Set the relative file path for the Django FileField
-            # We use os.path.relpath to correctly store the path relative to MEDIA_ROOT
-            relative_path = os.path.relpath(pdf_path, settings.MEDIA_ROOT)
+    pdf_path = download_pdf(paper.pdf_url, openalex_id=paper.openalex_id)
+    if not pdf_path:
+        return False
 
-            paper.cached_file = relative_path
-            paper.save()
+    extracted_text = extract_text_from_pdf(pdf_path)
+    if extracted_text and len(extracted_text.strip()) > 100:
+        paper.text = extracted_text
+        rel_path = os.path.relpath(pdf_path, settings.REPO_CACHE_DIR)
+        paper.cached_file = rel_path
+        paper.save()
+        return True
 
-
-# --- Celery Tasks ---
-
-@shared_task(name="litapp.tasks.llm_generation_task")
-def llm_generation_task(job_id: int, paper_texts: list[str], prompt: str, topic: str):
-    """
-    MOCK: This task represents the second step: generating the review using an LLM.
-    It takes the extracted texts and the user's prompt to synthesize the review.
-    """
-    try:
-        job = LiteratureReviewJob.objects.get(pk=job_id)
-
-        # --- LLM Simulation ---
-        # In a real scenario, this is where you would call the Gemini API
-        # with the prompt and the concatenated paper texts as context.
-
-        context_length = sum(len(text) for text in paper_texts)
-        if context_length < 1000:
-            mock_content = f"The generated review is brief because only partial context ({context_length} chars) was available. Topic: {topic}. Prompt: {prompt}"
-        else:
-            mock_content = (
-                f"## Literature Review on: {topic}\n\n"
-                f"**Based on the user prompt:** *{prompt}*\n\n"
-                "This is a high-quality, AI-generated literature review synthesized "
-                f"from {len(paper_texts)} successfully extracted full-text documents. "
-                "The review provides a comprehensive analysis of key themes, methodologies, "
-                "and findings in the field, structured logically to address the user's query. "
-                f"Total context used: {context_length} characters. [Citations would appear here]"
-            )
-        # --- End LLM Simulation ---
-
-        # Create the final LiteratureReview object
-        review = LiteratureReview.objects.create(
-            user=job.user,
-            topic=topic,
-            prompt=prompt,
-            content=mock_content,
-            # Mock citation data
-            citations={"paper-1": "Mock Citation (2024)", "paper-2": "Mock Citation (2023)"}
-        )
-
-        # Update the job status and link the review
-        job.status = "completed"
-        job.review = review
-        job.result_text = "Literature review successfully generated."
-        job.save()
-
-        logger.info(f"LLM task for Job {job_id} successfully completed.")
-
-    except Exception as e:
-        logger.exception(f"Error in LLM generation for Job {job_id}: {e}")
-        job.status = "failed"
-        job.error_message = str(e)
-        job.save()
+    return False
 
 
-@shared_task(bind=True, name="litapp.tasks.generate_literature_review_job")
+# ---------------------------------------------------------------------
+# Celery tasks
+# ---------------------------------------------------------------------
+
+
+@shared_task(bind=True, name="litapp.tasks.generate_literature_review_job", max_retries=2, default_retry_delay=120)
 def generate_literature_review_job(self, job_id: int):
-    """
-    STEP 1: Fetches papers, downloads PDFs, caches files, and extracts full text.
-    On successful completion, it chains to the llm_generation_task (Step 2).
-    """
+    job = None
     try:
-        job = LiteratureReviewJob.objects.get(pk=job_id)
-    except LiteratureReviewJob.DoesNotExist:
-        logger.error(f"LiteratureReviewJob {job_id} does not exist.")
-        return
+        # Start atomic transaction for select_for_update
+        with transaction.atomic():
+            job = LiteratureReviewJob.objects.select_for_update().get(pk=job_id)
+            # If the task was triggered with a custom UUID, store it
+            if not job.celery_task_id:
+                job.celery_task_id = self.request.id  # Celery-generated task_id or custom UUID
+                job.save(update_fields=["celery_task_id"])
 
-    # Use a transaction for safety, although Celery tasks already handle atomic operations
-    # within the task scope.
-    with transaction.atomic():
-        job.status = "processing"
-        job.save()
+            job.status = "processing"
+            job.result_text = "Fetching papers and extracting full texts..."
+            job.save()
 
-    try:
-        # Step 1: Search OpenAlex and attempt to download 30 papers
+        logger.info(f"Job {job_id}: Starting literature fetch for '{job.topic}'")
+
+        # Fetch metadata from OpenAlex
         papers_data = fetch_openalex_works_data(job.topic, per_page=30)
+        if not papers_data:
+            raise ValueError(f"No papers found for topic '{job.topic}'")
 
-        extracted_texts = []
-        downloaded_count = 0
-
-        for raw_paper_data in papers_data:
+        extracted_papers = []
+        for raw_data in papers_data:
             try:
-                paper = create_or_update_paper(raw_paper_data)
-                process_pdf_and_extract_text(paper)
-
-                if paper.text:
-                    extracted_texts.append(paper.text)
-
-                if paper.cached_file:
-                    downloaded_count += 1
-
+                paper = create_or_update_paper(raw_data)
+                if process_pdf_and_extract_text(paper):
+                    extracted_papers.append(paper.openalex_id)
             except Exception as e:
-                # Log non-critical errors (like a single bad paper) and continue
-                logger.warning(f"Skipping paper {raw_paper_data.get('id')} due to error: {e}")
+                logger.warning(f"Job {job_id}: Failed to process paper: {e}")
                 continue
 
-        # Check if enough text was extracted to proceed
-        if not extracted_texts:
-            job.status = "failed"
-            job.error_message = "No full-text could be extracted from the search results."
-            job.save()
-            return
+        if not extracted_papers:
+            raise ValueError("No full text could be extracted from any paper")
 
-        # Log completion of data retrieval phase
-        log_message = (f"Data retrieval complete for Job {job_id}. "
-                       f"Found {len(papers_data)} results, extracted text from {len(extracted_texts)}.")
-        logger.info(log_message)
-
-        # Update job status and result text before chaining to LLM task
-        job.result_text = log_message
-        job.save()
-
-        # Step 2: Chain to the LLM generation task for synthesis
-        llm_generation_task.delay(
-            job.id,
-            extracted_texts,
-            job.prompt,
-            job.topic
+        # Chain next task
+        llm_generation_task.apply_async(
+            args=[job.id, extracted_papers, job.topic],
+            countdown=3
         )
-
-        # NOTE: The job status will be marked 'completed' by llm_generation_task.
-
-        return {"job_id": job_id, "papers_found": len(papers_data), "pdfs_extracted": len(extracted_texts)}
+        logger.info(f"Job {job_id}: Queued LLM generation for {len(extracted_papers)} papers")
+        return {"success": True, "papers": len(extracted_papers)}
 
     except Exception as e:
-        logger.exception(f"CRITICAL Error during data fetching for Job {job_id}: {e}")
-
-        # Use transaction for rollback safety in case of severe failure
-        with transaction.atomic():
+        logger.exception(f"Error in job {job_id}: {e}")
+        if job:
             job.status = "failed"
             job.error_message = str(e)
             job.save()
-            return
+        return {"success": False, "error": str(e)}
+
+
+@shared_task(bind=True, name="litapp.tasks.llm_generation_task", max_retries=3, default_retry_delay=60)
+def llm_generation_task(self, job_id: int, paper_ids: List[str], topic: str):
+    """
+    Step 2: Summarizes extracted text using GPT to generate a literature review.
+    """
+    job = None
+    try:
+        job = LiteratureReviewJob.objects.select_for_update().get(pk=job_id)
+        papers = Paper.objects.filter(openalex_id__in=paper_ids, text__isnull=False).exclude(text="")
+
+        if not papers.exists():
+            raise ValueError("No papers with extracted text available")
+
+        paper_snippets = [
+            {
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "text": p.text[:4000],  # Truncate long texts
+            }
+            for p in papers
+        ]
+
+        context = "\n\n---\n\n".join(
+            f"Title: {p['title']}\nAuthors: {p['authors']}\nYear: {p['year']}\n\n{p['text']}"
+            for p in paper_snippets
+        )
+
+        # Static system and user prompts
+        system_prompt = (
+            "You are a scholarly AI specialized in writing academic literature reviews. "
+            "You will read excerpts from research papers and synthesize them into a comprehensive, "
+            "structured, and well-cited literature review in a formal academic tone."
+        )
+
+        user_prompt = (
+            f"Topic: {topic}\n\n"
+            "Using the following excerpts from papers, write a detailed literature review summarizing "
+            "key findings, research gaps, and future directions. Include inline citations where appropriate.\n\n"
+            f"{context}"
+        )
+
+        logger.info(f"Job {job_id}: Generating LLM-based literature review")
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=2500,
+            temperature=0.5,
+        )
+
+        content = response.choices[0].message.content.strip()
+        if not content or len(content) < 200:
+            raise ValueError("Generated review content too short or invalid")
+
+        citations = {
+            f"paper-{i+1}": f"{p['authors']} ({p['year']})"
+            for i, p in enumerate(paper_snippets[:10])
+        }
+
+        with transaction.atomic():
+            review = LiteratureReview.objects.create(
+                user=job.user,
+                topic=topic,
+                content=content,
+                citations=citations,
+            )
+            review.papers.add(*Paper.objects.filter(openalex_id__in=paper_ids))
+
+            job.status = "completed"
+            job.review = review
+            job.result_text = f"Generated review from {len(paper_snippets)} papers."
+            job.completed_at = timezone.now()
+            job.save()
+
+        logger.info(f"Job {job_id}: Literature review generation completed successfully")
+        return {"success": True, "review_id": review.id}
+
+    except Exception as e:
+        logger.exception(f"LLM task failed for Job {job_id}: {e}")
+        if job:
+            job.mark_failed(str(e))
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e)
+        return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------
+# Maintenance tasks
+# ---------------------------------------------------------------------
+
+@shared_task(name="litapp.tasks.cleanup_old_pdfs_task")
+def cleanup_old_pdfs_task(days_old: int = 30):
+    """
+    Removes cached PDFs older than `days_old`.
+    """
+    from litapp.utils import clean_old_cached_pdfs
+    try:
+        removed = clean_old_cached_pdfs(days_old)
+        logger.info(f"Removed {removed} old cached PDFs")
+        return {"success": True, "removed": removed}
+    except Exception as e:
+        logger.exception(f"Error in cleanup_old_pdfs_task: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@shared_task(name="litapp.tasks.cleanup_stale_jobs_task")
+def cleanup_stale_jobs_task():
+    """
+    Marks 'processing' jobs older than 2h as failed.
+    """
+    from datetime import timedelta
+    try:
+        threshold = timezone.now() - timedelta(hours=2)
+        stale_jobs = LiteratureReviewJob.objects.filter(status="processing", updated_at__lt=threshold)
+        count = stale_jobs.count()
+        if count:
+            stale_jobs.update(
+                status="failed",
+                error_message="Job timed out or worker stopped unexpectedly",
+                completed_at=timezone.now(),
+            )
+            logger.warning(f"Marked {count} stale jobs as failed")
+        return {"success": True, "count": count}
+    except Exception as e:
+        logger.exception(f"Error in cleanup_stale_jobs_task: {e}")
+        return {"success": False, "error": str(e)}
