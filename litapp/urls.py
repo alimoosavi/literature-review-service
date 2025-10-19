@@ -1,51 +1,15 @@
-from django.urls import path
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
 
-from .views import (
-    SubmitLiteratureReviewSearch,
-    CheckJobStatus,
-    GetCompletedReview,
-    UserSearchHistoryList,
-    CancelJob,
-    DeleteReview,
-)
+from .views import LiteratureReviewJobViewSet, SearchHistoryViewSet, ReviewViewSet
 
 app_name = 'litapp'
 
-urlpatterns = [
-    # Main workflow endpoints
-    path(
-        "search/",
-        SubmitLiteratureReviewSearch.as_view(),
-        name="submit_search"
-    ),
-    # Check job status by database ID
-    path(
-        "job/<int:tracking_id>/status/",
-        CheckJobStatus.as_view(),
-        name="check_job_status"
-    ),
-    # Retrieve completed review by database ID
-    path(
-        "job/<int:tracking_id>/result/",
-        GetCompletedReview.as_view(),
-        name="get_completed_review"
-    ),
-    # Cancel job by database ID
-    path(
-        "job/<int:tracking_id>/cancel/",
-        CancelJob.as_view(),
-        name="cancel_job"
-    ),
+router = DefaultRouter()
+router.register(r'jobs', LiteratureReviewJobViewSet, basename='jobs')
+router.register(r'history', SearchHistoryViewSet, basename='history')
+router.register(r'reviews', ReviewViewSet, basename='reviews')
 
-    # History and management
-    path(
-        "history/",
-        UserSearchHistoryList.as_view(),
-        name="search_history"
-    ),
-    path(
-        "review/<int:review_id>/delete/",
-        DeleteReview.as_view(),
-        name="delete_review"
-    ),
+urlpatterns = [
+    path('', include(router.urls)),
 ]

@@ -11,15 +11,15 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "${POSTGRES_PORT}:${POSTGRES_PORT}"
+      - "${POSTGRES_PORT}:5432"
 
   redis:
     image: redis:7
     container_name: litrevai_redis
-    ports:
-      - "${REDIS_PORT}:${REDIS_PORT}"
     volumes:
       - redis_data:/data
+    ports:
+      - "${REDIS_PORT}:6379"
     command: ["redis-server", "--appendonly", "yes"]
 
 volumes:

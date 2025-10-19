@@ -124,7 +124,6 @@ class SearchHistorySerializer(serializers.ModelSerializer):
 class SubmitSearchSerializer(serializers.Serializer):
     """Serializer for validating search submission requests."""
     topic = serializers.CharField(
-        min_length=3,
         max_length=255,
         required=True,
         help_text="Research topic to search for"

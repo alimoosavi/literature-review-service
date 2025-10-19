@@ -254,11 +254,12 @@ def fetch_openalex_works_data(topic: str, per_page: int = 30) -> list:
         'filter': 'is_oa:true,type:journal-article',  # Open Access only
         'sort': 'cited_by_count:desc',  # Most cited first
         'per-page': per_page,
-        'mailto': getattr(settings, 'OPENALEX_DEFAULT_MAILTO', 'admin@example.com')
+        # 'mailto': getattr(settings, 'OPENALEX_DEFAULT_MAILTO', 'admin@example.com')
     }
 
     headers = {
-        "User-Agent": f"Mozilla/5.0 (compatible; LitRevGenerator/1.0; mailto:{params['mailto']})"
+        # "User-Agent": f"Mozilla/5.0 (compatible; LitRevGenerator/1.0; mailto:{params['mailto']})"
+        "User-Agent": f"Mozilla/5.0 (compatible; LitRevGenerator/1.0)"
     }
 
     try:
