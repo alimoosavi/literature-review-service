@@ -1,3 +1,7 @@
 .venv
 
 .env
+
+media
+
+logs

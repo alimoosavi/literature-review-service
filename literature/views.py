@@ -1,55 +1,99 @@
-from rest_framework import viewsets, permissions, status
+# literature/views.py
+from uuid import UUID
+from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.shortcuts import get_object_or_404
-from .models import SearchQuery, TaskStatus
+from rest_framework.permissions import IsAuthenticated
+from celery.result import AsyncResult
+from .models import ReviewTask
 from .serializers import (
-    SearchQuerySerializer,
-    SearchQueryCreateSerializer,
-    TaskStatusSerializer,
-    LiteratureReviewSerializer,
+    ReviewTaskCreateSerializer,
+    ReviewTaskStatusSerializer,
+    ReviewTaskResultSerializer,
+    ReviewTaskDetailSerializer
 )
-from .tasks import process_search_query  # async task handler
+from .tasks import generate_review_task
 
 
-class IsOwner(permissions.BasePermission):
-    """Ensure users only access their own queries."""
-    def has_object_permission(self, request, view, obj):
-        return obj.user == request.user
+class ReviewTaskViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated]
 
+    def create(self, request):
+        serializer = ReviewTaskCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
-class SearchQueryViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated, IsOwner]
+        task = ReviewTask.objects.create(
+            user=request.user,
+            topic=serializer.validated_data['topic'],
+            prompt=serializer.validated_data['prompt'],
+            status='pending'
+        )
 
-    def get_queryset(self):
-        return SearchQuery.objects.filter(user=self.request.user).order_by("-timestamp")
+        # Launch Celery task
+        celery_task = generate_review_task.delay(task.id)
+        task.celery_task_id = celery_task.id
+        task.save()
 
-    def get_serializer_class(self):
-        if self.action == "create":
-            return SearchQueryCreateSerializer
-        return SearchQuerySerializer
+        return Response({
+            'tracking_id': str(task.tracking_id),
+            'status': task.status,
+            'message': 'Review generation started. Use the tracking_id to monitor status.'
+        }, status=status.HTTP_201_CREATED)
 
-    def perform_create(self, serializer):
-        query = serializer.save(user=self.request.user)
-        for t in ["search", "download", "extract", "generate"]:
-            TaskStatus.objects.create(search_query=query, task_type=t, status="pending")
+    def retrieve(self, request, pk=None):
+        task = self.get_task(pk)
+        serializer = ReviewTaskDetailSerializer(task)
+        return Response(serializer.data)
 
-        # Trigger async job (Celery or background thread)
-        try:
-            process_search_query.delay(query.id)
-        except Exception as e:
-            print("Async task failed:", e)
+    def list(self, request):
+        tasks = ReviewTask.objects.filter(user=request.user).order_by('-created_at')
+        serializer = ReviewTaskStatusSerializer(tasks, many=True)
+        return Response(serializer.data)
 
-    @action(detail=True, methods=["get"])
+    @action(detail=True, methods=['get'])
     def status(self, request, pk=None):
-        query = get_object_or_404(SearchQuery, pk=pk, user=request.user)
-        serializer = TaskStatusSerializer(query.tasks.all(), many=True)
+        task = self.get_task(pk)
+        return Response({
+            'tracking_id': str(task.tracking_id),
+            'status': task.status,
+            'current_stage': task.get_current_stage_display() if task.current_stage else None
+        })
+
+    @action(detail=True, methods=['get'])
+    def result(self, request, pk=None):
+        task = self.get_task(pk)
+        if task.status != 'finished':
+            return Response({
+                'error': 'Task not finished',
+                'status': task.status
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = ReviewTaskResultSerializer(task)
         return Response(serializer.data)
 
-    @action(detail=True, methods=["get"])
-    def review(self, request, pk=None):
-        query = get_object_or_404(SearchQuery, pk=pk, user=request.user)
-        if not hasattr(query, "review"):
-            return Response({"detail": "Review not generated yet."}, status=404)
-        serializer = LiteratureReviewSerializer(query.review)
-        return Response(serializer.data)
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        task = self.get_task(pk)
+        if task.status not in ['pending', 'running']:
+            return Response({'error': 'Task cannot be canceled'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if task.celery_task_id:
+            AsyncResult(task.celery_task_id).revoke(terminate=True, signal=15)
+
+        task.status = 'canceled'
+        task.current_stage = None
+        task.save()
+
+        return Response({'tracking_id': str(task.tracking_id), 'status': 'canceled'})
+
+    def get_task(self, pk):
+        try:
+            # Allow pk as int (id) or str (tracking_id)
+            if pk.isdigit():
+                task = ReviewTask.objects.get(id=int(pk), user=self.request.user)
+            else:
+                task = ReviewTask.objects.get(tracking_id=UUID(pk), user=self.request.user)
+            return task
+        except (ReviewTask.DoesNotExist, ValueError):
+            from rest_framework.exceptions import NotFound
+            raise NotFound('Task not found')

@@ -130,7 +130,7 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.UserRateThrottle",
     ],
     "DEFAULT_THROTTLE_RATES": {
-        "user": "100/hour",
+        "user": "10000/hour",
         "literature_review": os.getenv("LITERATURE_REVIEW_THROTTLE", "500/hour"),
     },
 }

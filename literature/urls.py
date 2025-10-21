@@ -1,7 +1,13 @@
+# literature/urls.py
+from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import SearchQueryViewSet
+from .views import ReviewTaskViewSet
 
-router = DefaultRouter()
-router.register(r"queries", SearchQueryViewSet, basename="searchquery")
+# Create a router and register the ViewSet
+router = DefaultRouter(trailing_slash=False)
+router.register(r'reviews', ReviewTaskViewSet, basename='reviewtask')
 
-urlpatterns = router.urls
+# The API URLs are determined by the router
+urlpatterns = [
+    path('', include(router.urls)),
+]
