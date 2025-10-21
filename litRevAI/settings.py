@@ -33,7 +33,7 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt",
     "corsheaders",
     "authapp",
-    "litapp",
+    "literature"
 ]
 
 MIDDLEWARE = [
@@ -214,10 +214,6 @@ LOGGING = {
         "django": {
             "handlers": ["console", "file"],
             "level": "INFO",
-        },
-        "litapp": {
-            "handlers": ["console", "file"],
-            "level": "DEBUG" if DEBUG else "INFO",
         },
         "celery": {
             "handlers": ["console", "file"],
