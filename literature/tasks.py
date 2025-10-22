@@ -15,20 +15,23 @@ from .models import ReviewTask, Paper
 logger = logging.getLogger(__name__)
 
 # === Constants ===
-MAX_WORKERS = 5  # Concurrency for PDF download and text extraction
-MIN_REVIEW_WORDS = 3000  # Minimum words for literature review
-PDF_MIN_SIZE = 50000  # Minimum PDF size in bytes
-MAX_OPENAI_TOKENS = 4096  # Max tokens for OpenAI calls
+MAX_WORKERS = 5
+MIN_REVIEW_WORDS = 3000
+PDF_MIN_SIZE = 50000
+MAX_OPENAI_TOKENS = 4096
+DESIRED_PDF_COUNT = 30
+PER_PAGE = 30
+MAX_PAGES = 5  # limit number of OpenAlex pages to fetch
+
 
 # === Helper Functions ===
 def sanitize_text(text):
-    """Remove NUL characters and other problematic bytes from text."""
     if not text:
         return text
     return text.replace('\x00', '').replace('\u0000', '')
 
+
 def update_task_progress(task):
-    """Update progress percentage based on task stage."""
     if not task.total_papers_target or task.total_papers_target == 0:
         task.progress_percent = 0.0
         task.save(update_fields=['progress_percent'])
@@ -59,9 +62,9 @@ def update_task_progress(task):
     task.progress_percent = min(progress, 99.0)
     task.save(update_fields=['progress_percent'])
 
+
 # === PDF Download ===
 def download_pdf(paper, pdf_dir):
-    """Download PDF in a blocking way (thread-safe)."""
     if not paper.pdf_url or paper.pdf_path:
         return False
     try:
@@ -78,17 +81,12 @@ def download_pdf(paper, pdf_dir):
         logger.warning(f"Failed to download PDF for {paper.title}: {e}")
     return False
 
+
 def extract_text_from_pdf(paper):
-    """Extract text from PDF using PyMuPDF."""
     if not paper.pdf_path or paper.extracted_text:
         return False
     try:
-        # Handle FieldFile properly
-        if hasattr(paper.pdf_path, 'path'):
-            full_path = paper.pdf_path.path
-        else:
-            full_path = os.path.join(settings.MEDIA_ROOT, str(paper.pdf_path))
-
+        full_path = getattr(paper.pdf_path, 'path', os.path.join(settings.MEDIA_ROOT, str(paper.pdf_path)))
         doc = fitz.open(full_path)
         text = "".join(page.get_text() for page in doc)
         doc.close()
@@ -100,9 +98,8 @@ def extract_text_from_pdf(paper):
         logger.warning(f"Failed to extract text for {paper.title}: {e}")
     return False
 
-# === Summarization ===
+
 def summarize_paper(client, paper, task):
-    """Summarize paper using OpenAI."""
     if not paper.extracted_text or paper.summary:
         return False
     try:
@@ -138,7 +135,8 @@ def summarize_paper(client, paper, task):
         paper.save()
     return False
 
-# === Main Celery Task ===
+
+# === Main Task ===
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def generate_review_task(self, task_id):
     try:
@@ -148,61 +146,61 @@ def generate_review_task(self, task_id):
         task.save()
 
         client = OpenAI(api_key=settings.OPENAI_API_KEY)
-
-        # === Step 1: Search OpenAlex ===
-        query = task.topic.replace(" ", "+")
-        url = settings.OPENALEX_WORKS_URL
-        params = {
-            'search': query,
-            'per_page': 30,
-            'sort': 'cited_by_count:desc',
-            'filter': 'has_abstract:true',
-            'mailto': settings.OPENALEX_DEFAULT_MAILTO
-        }
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        papers_data = response.json().get('results', [])
-
-        task.papers_found = len(papers_data)
-        task.total_papers_target = len(papers_data)
-        task.save()
-        update_task_progress(task)
-
-        # === Step 2: Create/Update Papers ===
         pdf_dir = os.path.join(settings.MEDIA_ROOT, 'pdfs')
         os.makedirs(pdf_dir, exist_ok=True)
+
         paper_objs = []
-        for p_data in papers_data:
-            oa_id = p_data['id'].split('/')[-1]
-            doi = p_data.get('doi')
-            if doi:
-                doi = doi.replace('https://doi.org/', '')
-            paper, _ = Paper.objects.get_or_create(
-                openalex_id=oa_id,
-                defaults={
-                    'doi': doi,
-                    'title': p_data.get('title', 'Unknown Title'),
-                    'authors': [a['author'].get('display_name', 'Unknown') for a in p_data.get('authorships', [])],
-                    'year': p_data.get('publication_year'),
-                    'pdf_url': p_data.get('open_access', {}).get('oa_url'),
-                }
-            )
-            task.papers.add(paper)
-            paper_objs.append(paper)
+        pdf_count = 0
+        page = 1
+        task.total_papers_target = 0
 
-        # === Step 3: Download PDFs using threads ===
-        task.current_stage = 'downloading_pdfs'
-        task.save()
-        update_task_progress(task)
+        # === Step 1: Fetch papers from OpenAlex ===
+        while pdf_count < DESIRED_PDF_COUNT and page <= MAX_PAGES:
+            url = settings.OPENALEX_WORKS_URL
+            params = {
+                'search': task.topic.replace(" ", "+"),
+                'per_page': PER_PAGE,
+                'page': page,
+                'sort': 'cited_by_count:desc',
+                'filter': 'has_abstract:true',
+                'mailto': settings.OPENALEX_DEFAULT_MAILTO
+            }
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            papers_data = response.json().get('results', [])
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(download_pdf, p, pdf_dir) for p in paper_objs]
-            download_count = sum(f.result() for f in futures)
-        task.papers_downloaded = download_count
-        task.save()
-        update_task_progress(task)
+            if not papers_data:
+                break
 
-        # === Step 4: Extract Text concurrently ===
+            for p_data in papers_data:
+                oa_id = p_data['id'].split('/')[-1]
+                doi = p_data.get('doi', '').replace('https://doi.org/', '')
+                paper, _ = Paper.objects.get_or_create(
+                    openalex_id=oa_id,
+                    defaults={
+                        'doi': doi,
+                        'title': p_data.get('title', 'Unknown Title'),
+                        'authors': [a['author'].get('display_name', 'Unknown') for a in p_data.get('authorships', [])],
+                        'year': p_data.get('publication_year'),
+                        'pdf_url': p_data.get('open_access', {}).get('oa_url')
+                    }
+                )
+                paper.openalex_abstract = p_data.get('abstract_inverted_index', None)
+                task.papers.add(paper)
+                paper_objs.append(paper)
+                task.total_papers_target += 1
+
+                if download_pdf(paper, pdf_dir):
+                    pdf_count += 1
+                if pdf_count >= DESIRED_PDF_COUNT:
+                    break
+
+            page += 1
+            task.papers_found = len(paper_objs)
+            task.save()
+            update_task_progress(task)
+
+        # === Step 2: Extract Text concurrently ===
         task.current_stage = 'extracting_text'
         task.save()
         update_task_progress(task)
@@ -214,7 +212,7 @@ def generate_review_task(self, task_id):
         task.save()
         update_task_progress(task)
 
-        # === Step 5: Summarize Papers sequentially ===
+        # === Step 3: Summarize Papers sequentially ===
         task.current_stage = 'summarizing_papers'
         task.save()
         summarize_count = 0
@@ -225,7 +223,7 @@ def generate_review_task(self, task_id):
                 task.save()
                 update_task_progress(task)
 
-        # === Step 6: Generate Literature Review ===
+        # === Step 4: Generate Literature Review in batches ===
         task.current_stage = 'generating_review'
         task.save()
         update_task_progress(task)
@@ -234,9 +232,8 @@ def generate_review_task(self, task_id):
             {
                 'title': p.title,
                 'citation': f"({p.authors[0].split()[-1] if p.authors else 'Unknown'} et al., {p.year or 'n.d.'})",
-                'doi': p.doi,
-                'summary': p.summary
-            } for p in paper_objs if p.summary and "[failed]" not in p.summary.lower()
+                'summary': p.summary or getattr(p, 'openalex_abstract', None) or "[No text available]"
+            } for p in paper_objs if p.summary or getattr(p, 'openalex_abstract', None)
         ]
 
         if not processed_papers:
@@ -245,52 +242,47 @@ def generate_review_task(self, task_id):
             task.save()
             return
 
-        context = "\n\n".join([f"[{p['citation']}] {p['title']}\nSummary: {p['summary']}" for p in processed_papers])
+        # === Batch processing ===
+        BATCH_SIZE = 6
+        batches = [processed_papers[i:i + BATCH_SIZE] for i in range(0, len(processed_papers), BATCH_SIZE)]
+        batch_reviews = []
 
-        # === Improved review prompt ===
-        review_prompt = f"""
-        Output Format
-        The final literature review must:
-        • Contain at least {MIN_REVIEW_WORDS} words
-        • Include inline citations like (Smith et al., 2023) for each claim
-        • End with a bibliography list of all cited papers
-        • Follow APA or IEEE style (you may choose APA)
-        • Be structured into these sections:
-          1. Introduction
-          2. Historical evolution / background
-          3. Methods and approaches used in the papers
-          4. Key findings and results
-          5. Research gaps and challenges
-          6. Future directions and opportunities
-          7. Conclusion
+        for idx, batch in enumerate(batches, start=1):
+            batch_context = "\n\n".join(
+                [f"[{p['citation']}] {p['title']}\nSummary: {p['summary']}" for p in batch]
+            )
+            batch_prompt = f"""
+            Generate a detailed literature review section using the following papers (batch {idx} of {len(batches)}):
 
-        User Request:
-        {task.prompt}
+            User Request:
+            {task.prompt}
 
-        Provided Papers ({len(processed_papers)}):
-        {context}
+            Provided Papers ({len(batch)}):
+            {batch_context}
 
-        Instructions:
-        - Use only the provided sources.
-        - Analyze, synthesize, and critically evaluate the studies.
-        - Highlight similarities, differences, and contradictions between studies.
-        - Maintain a formal academic tone suitable for a journal article.
-        - Include inline citations in the text and a complete reference list at the end.
-        - Ensure logical flow between sections.
-        """
+            Instructions:
+            - Use only the provided sources.
+            - Analyze, synthesize, and critically evaluate.
+            - Include inline citations and maintain formal academic tone.
+            """
+            try:
+                batch_resp = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "user", "content": batch_prompt}],
+                    max_tokens=MAX_OPENAI_TOKENS,
+                    temperature=0.7
+                )
+                batch_text = batch_resp.choices[0].message.content.strip()
+                batch_reviews.append(batch_text)
+            except Exception as e:
+                logger.error(f"Failed to generate review for batch {idx}: {e}")
+                batch_reviews.append(f"[Batch {idx} failed to generate review]")
 
-        review_resp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": review_prompt}],
-            max_tokens=MAX_OPENAI_TOKENS,
-            temperature=0.7
-        )
+        final_review_text = "\n\n".join(batch_reviews)
+        if len(final_review_text.split()) < MIN_REVIEW_WORDS:
+            final_review_text += f"\n\n[Note: Review is shorter than {MIN_REVIEW_WORDS} words due to limited source material.]"
 
-        review_text = review_resp.choices[0].message.content.strip()
-        if len(review_text.split()) < MIN_REVIEW_WORDS:
-            review_text += f"\n\n[Note: Review is shorter than {MIN_REVIEW_WORDS} words due to limited source material.]"
-
-        task.result = sanitize_text(review_text)
+        task.result = sanitize_text(final_review_text)
         task.status = 'finished'
         task.current_stage = None
         task.progress_percent = 100.0
