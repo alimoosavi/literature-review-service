@@ -1,12 +1,14 @@
 # literature/tasks.py
+import logging
 import os
 import uuid
-import logging
-import requests
+
 import fitz  # PyMuPDF
+import requests
 from celery import shared_task
 from django.conf import settings
 from openai import OpenAI, APIError, RateLimitError
+
 from .models import ReviewTask, Paper
 
 logger = logging.getLogger(__name__)
@@ -20,18 +22,19 @@ def generate_review_task(self, task_id):
         task.current_stage = 'searching_openalex'
         task.save()
 
-        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
         if not client.api_key:
-            raise ValueError("OPENAI_API_KEY not set in environment.")
+            raise ValueError("OPENAI_API_KEY not set in Django settings.")
 
         # === Step 1: Search OpenAlex ===
         query = task.topic.replace(" ", "+")
-        url = "https://api.openalex.org/works"
+        url = settings.OPENALEX_WORKS_URL
         params = {
             'search': query,
             'per_page': 30,
             'sort': 'cited_by_count:desc',
-            'filter': 'has_abstract:true'
+            'filter': 'has_abstract:true',
+            'mailto': settings.OPENALEX_DEFAULT_MAILTO
         }
 
         try:
@@ -45,6 +48,9 @@ def generate_review_task(self, task_id):
             raise ValueError(f"Failed to search OpenAlex: {str(e)}")
 
         logger.info(f"Found {len(papers_data)} papers on OpenAlex.")
+        task.papers_found = len(papers_data)
+        task.total_papers_target = len(papers_data)
+        task.save()
 
         # === Step 2: Process Papers (Reuse + Download + Extract + Summarize) ===
         task.current_stage = 'downloading_pdfs'
@@ -54,6 +60,7 @@ def generate_review_task(self, task_id):
         os.makedirs(pdf_dir, exist_ok=True)
 
         processed_papers = []
+        downloaded_pdfs = []  # Collect paths for extraction
         download_count = extract_count = summarize_count = 0
 
         for p_data in papers_data[:30]:
@@ -76,7 +83,8 @@ def generate_review_task(self, task_id):
 
             # Update metadata
             paper.title = p_data.get('title', paper.title)
-            paper.authors = [a['author'].get('display_name', '') for a in p_data.get('authorships', [])] or paper.authors
+            paper.authors = [a['author'].get('display_name', '') for a in
+                             p_data.get('authorships', [])] or paper.authors
             paper.year = p_data.get('publication_year') or paper.year
             paper.pdf_url = p_data.get('open_access', {}).get('oa_url') or paper.pdf_url
             paper.save()
@@ -95,9 +103,14 @@ def generate_review_task(self, task_id):
                         paper.pdf_path = os.path.join('pdfs', pdf_filename)
                         paper.save()
                         download_count += 1
+                        downloaded_pdfs.append(pdf_path)  # Collect for later
                         logger.info(f"Downloaded PDF for: {paper.title}")
                 except Exception as e:
                     logger.warning(f"PDF download failed for {paper.title}: {e}")
+
+            # Update download count
+            task.papers_downloaded = download_count
+            task.save()
 
             # === Extract Text ===
             if paper.pdf_path and not paper.extracted_text:
@@ -105,7 +118,8 @@ def generate_review_task(self, task_id):
                 task.save()
 
                 try:
-                    full_path = os.path.join(settings.MEDIA_ROOT, paper.pdf_path.path if hasattr(paper.pdf_path, 'path') else paper.pdf_path)
+                    full_path = os.path.join(settings.MEDIA_ROOT, paper.pdf_path if not hasattr(paper.pdf_path,
+                                                                                                'path') else paper.pdf_path.path)
                     doc = fitz.open(full_path)
                     text = ""
                     for page in doc:
@@ -119,6 +133,10 @@ def generate_review_task(self, task_id):
                         logger.info(f"Extracted text for: {paper.title}")
                 except Exception as e:
                     logger.warning(f"Text extraction failed for {paper.title}: {e}")
+
+            # Update extract count
+            task.papers_extracted = extract_count  # Assuming you add this field if needed
+            task.save()
 
             # === Summarize ===
             if paper.extracted_text and not paper.summary:
@@ -159,8 +177,12 @@ def generate_review_task(self, task_id):
                     paper.summary = "[Summary failed]"
                     paper.save()
 
+            # Update summarize count
+            task.papers_summarized = summarize_count
+            task.save()
+
             # === Collect for Review ===
-            if paper.summary and "[failed]" not in paper.summary.lower() and len(paper.summary) > 100:
+            if paper.summary and "[failed]" not in paper.summary.lower() and len(summary) > 100:
                 first_author = paper.authors[0].split()[-1] if paper.authors else "Unknown"
                 year = paper.year or "n.d."
                 citation = f"({first_author} et al., {year})"

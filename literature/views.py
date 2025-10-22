@@ -50,13 +50,15 @@ class ReviewTaskViewSet(viewsets.ViewSet):
         serializer = ReviewTaskStatusSerializer(tasks, many=True)
         return Response(serializer.data)
 
+    # literature/views.py
     @action(detail=True, methods=['get'])
     def status(self, request, pk=None):
         task = self.get_task(pk)
         return Response({
             'tracking_id': str(task.tracking_id),
             'status': task.status,
-            'current_stage': task.get_current_stage_display() if task.current_stage else None
+            'current_stage': task.get_current_stage_display() if task.current_stage else None,
+            'progress_percent': task.progress_percent,  # <-- only this
         })
 
     @action(detail=True, methods=['get'])
