@@ -1,10 +1,14 @@
 # literature/views.py
 from uuid import UUID
+
+from celery.result import AsyncResult
+from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
-from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from celery.result import AsyncResult
+from rest_framework.response import Response
+
 from .models import ReviewTask
 from .serializers import (
     ReviewTaskCreateSerializer,
@@ -13,6 +17,7 @@ from .serializers import (
     ReviewTaskDetailSerializer
 )
 from .tasks import generate_review_task
+from .utils import export_review_to_pdf, export_review_to_docx
 
 
 class ReviewTaskViewSet(viewsets.ViewSet):
@@ -49,6 +54,34 @@ class ReviewTaskViewSet(viewsets.ViewSet):
         tasks = ReviewTask.objects.filter(user=request.user).order_by('-created_at')
         serializer = ReviewTaskStatusSerializer(tasks, many=True)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['get'], url_path='export')
+    def export(self, request, pk=None):
+        """
+        Export the finished review as PDF or DOCX.
+        URL example: /api/literature/reviews/<tracking_id>/export?format=pdf
+        """
+        task = self.get_task(pk)
+
+        if task.status != 'finished' or not task.result:
+            return Response({'detail': 'Review not ready yet.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        file_format = request.query_params.get('format', 'pdf').lower()
+        if file_format not in ('pdf', 'docx'):
+            return Response({'detail': 'Invalid format, choose pdf or docx.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if file_format == 'pdf':
+            file_bytes = export_review_to_pdf(task.result, task.topic)
+            content_type = 'application/pdf'
+            filename = f'review_{task.tracking_id}.pdf'
+        else:
+            file_bytes = export_review_to_docx(task.result, task.topic)
+            content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            filename = f'review_{task.tracking_id}.docx'
+
+        response = HttpResponse(file_bytes, content_type=content_type)
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
 
     # literature/views.py
     @action(detail=True, methods=['get'])

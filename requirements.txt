@@ -15,3 +15,5 @@ pyalex
 openai
 django-cors-headers
 aiohttp
+reportlab
+python-docx
