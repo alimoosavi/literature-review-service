@@ -21,15 +21,14 @@ PDF_MIN_SIZE = 50000
 MAX_OPENAI_TOKENS = 4096
 DESIRED_PDF_COUNT = 30
 PER_PAGE = 30
-MAX_PAGES = 5  # limit number of OpenAlex pages to fetch
-
+MAX_PAGES = 5
+BATCH_SIZE = 6  # number of papers per batch
 
 # === Helper Functions ===
 def sanitize_text(text):
     if not text:
         return text
     return text.replace('\x00', '').replace('\u0000', '')
-
 
 def update_task_progress(task):
     if not task.total_papers_target or task.total_papers_target == 0:
@@ -62,7 +61,6 @@ def update_task_progress(task):
     task.progress_percent = min(progress, 99.0)
     task.save(update_fields=['progress_percent'])
 
-
 # === PDF Download ===
 def download_pdf(paper, pdf_dir):
     if not paper.pdf_url or paper.pdf_path:
@@ -81,7 +79,6 @@ def download_pdf(paper, pdf_dir):
         logger.warning(f"Failed to download PDF for {paper.title}: {e}")
     return False
 
-
 def extract_text_from_pdf(paper):
     if not paper.pdf_path or paper.extracted_text:
         return False
@@ -97,7 +94,6 @@ def extract_text_from_pdf(paper):
     except Exception as e:
         logger.warning(f"Failed to extract text for {paper.title}: {e}")
     return False
-
 
 def summarize_paper(client, paper, task):
     if not paper.extracted_text or paper.summary:
@@ -134,7 +130,6 @@ def summarize_paper(client, paper, task):
         paper.summary = "[Summary failed]"
         paper.save()
     return False
-
 
 # === Main Task ===
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
@@ -200,7 +195,7 @@ def generate_review_task(self, task_id):
             task.save()
             update_task_progress(task)
 
-        # === Step 2: Extract Text concurrently ===
+        # === Step 2: Extract text concurrently ===
         task.current_stage = 'extracting_text'
         task.save()
         update_task_progress(task)
@@ -212,7 +207,7 @@ def generate_review_task(self, task_id):
         task.save()
         update_task_progress(task)
 
-        # === Step 3: Summarize Papers sequentially ===
+        # === Step 3: Summarize papers sequentially ===
         task.current_stage = 'summarizing_papers'
         task.save()
         summarize_count = 0
@@ -223,7 +218,7 @@ def generate_review_task(self, task_id):
                 task.save()
                 update_task_progress(task)
 
-        # === Step 4: Generate Literature Review in batches ===
+        # === Step 4: Batch processing and structured final review ===
         task.current_stage = 'generating_review'
         task.save()
         update_task_progress(task)
@@ -231,6 +226,9 @@ def generate_review_task(self, task_id):
         processed_papers = [
             {
                 'title': p.title,
+                'authors': p.authors,
+                'year': p.year,
+                'doi': p.doi,
                 'citation': f"({p.authors[0].split()[-1] if p.authors else 'Unknown'} et al., {p.year or 'n.d.'})",
                 'summary': p.summary or getattr(p, 'openalex_abstract', None) or "[No text available]"
             } for p in paper_objs if p.summary or getattr(p, 'openalex_abstract', None)
@@ -242,28 +240,28 @@ def generate_review_task(self, task_id):
             task.save()
             return
 
-        # === Batch processing ===
-        BATCH_SIZE = 6
+        # Split papers into batches
         batches = [processed_papers[i:i + BATCH_SIZE] for i in range(0, len(processed_papers), BATCH_SIZE)]
-        batch_reviews = []
+        batch_summaries = []
 
         for idx, batch in enumerate(batches, start=1):
             batch_context = "\n\n".join(
-                [f"[{p['citation']}] {p['title']}\nSummary: {p['summary']}" for p in batch]
+                [f"[{p['citation']}] {p['title']}\nAuthors: {', '.join(p['authors'])}\nYear: {p['year']}\nDOI: {p['doi']}\nSummary: {p['summary']}" for p in batch]
             )
             batch_prompt = f"""
-            Generate a detailed literature review section using the following papers (batch {idx} of {len(batches)}):
+            Generate a structured summary for this batch of papers (batch {idx} of {len(batches)}).
 
             User Request:
             {task.prompt}
 
-            Provided Papers ({len(batch)}):
+            Provided Papers:
             {batch_context}
 
             Instructions:
-            - Use only the provided sources.
-            - Analyze, synthesize, and critically evaluate.
-            - Include inline citations and maintain formal academic tone.
+            - Include a synthesized summary for the batch.
+            - Maintain formal academic tone.
+            - Include inline citations.
+            - Preserve paper list with title, authors, year, DOI.
             """
             try:
                 batch_resp = client.chat.completions.create(
@@ -273,12 +271,85 @@ def generate_review_task(self, task_id):
                     temperature=0.7
                 )
                 batch_text = batch_resp.choices[0].message.content.strip()
-                batch_reviews.append(batch_text)
+                batch_summaries.append(batch_text)
             except Exception as e:
                 logger.error(f"Failed to generate review for batch {idx}: {e}")
-                batch_reviews.append(f"[Batch {idx} failed to generate review]")
+                batch_summaries.append(f"[Batch {idx} failed to generate review]")
 
-        final_review_text = "\n\n".join(batch_reviews)
+        # Final aggregation step
+        final_context = "\n\n".join(batch_summaries)
+        final_prompt = f"""
+        You are tasked with generating a comprehensive, structured literature review from provided batch summaries of scientific papers.
+
+        Output Format:
+        - The final review must contain at least {MIN_REVIEW_WORDS} words.
+        - Include inline citations like (Smith et al., 2023) for every claim.
+        - Include a bibliography / reference list at the end.
+        - Follow APA or IEEE citation style consistently.
+        - Structure the review into the following sections:
+          1. Introduction
+          2. Historical evolution / Background
+          3. Methods and approaches
+          4. Key findings and results
+          5. Research gaps and challenges
+          6. Future directions
+          7. Conclusion
+        - Include the full list of all papers used with their title, authors, year, and DOI.
+
+        Few-shot Examples:
+
+        Example 1:
+        User Input:
+        Search topic: "Machine learning for catalyst design"
+        User request: "Focus the review on recent deep learning approaches for optimizing catalytic reactions."
+
+        Generated Review Excerpt:
+        "Recent progress in deep learning has accelerated catalyst discovery (Li & Chen, 2022). Graph neural networks are increasingly used for activity prediction (Zhao et al., 2023)..."
+
+        References:
+        Li, J., & Chen, Y. (2022). Graph neural networks for catalytic site prediction. *Journal of Catalysis, 414*, 210-225.
+        Zhao, K., et al. (2023). Deep learning for catalyst design. *Nature Communications, 14*(5), 2345.
+
+        Example 2:
+        User Input:
+        Search topic: "CRISPR gene editing in agriculture"
+        User request: "Focus on recent breakthroughs and their impact on crop yield and disease resistance."
+
+        Generated Review Excerpt:
+        "CRISPR-Cas9 has revolutionized plant genetic engineering, enabling precise genome edits to improve crop resistance (Smith et al., 2021). Recent studies demonstrate increased yield and pathogen resistance in edited rice and tomato varieties (Wang et al., 2022)..."
+
+        References:
+        Smith, A., et al. (2021). CRISPR-Cas9 in crop improvement. *Plant Biotechnology Journal, 19*(8), 1602-1615.
+        Wang, B., et al. (2022). CRISPR-mediated disease resistance in crops. *Nature Plants, 8*, 456-467.
+
+        Instructions:
+        - Use only the information provided in the batch summaries below.
+        - Synthesize, analyze, and critically evaluate the content.
+        - Maintain formal academic tone throughout.
+        - Include inline citations wherever necessary.
+        - Produce at least {MIN_REVIEW_WORDS} words.
+        - Conclude with a reference list of all papers used.
+        
+        User Request:
+        {task.prompt}
+        
+        Batch Summaries:
+        {final_context}
+        """
+
+        try:
+            final_resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": final_prompt}],
+                max_tokens=MAX_OPENAI_TOKENS,
+                temperature=0.7
+            )
+            final_review_text = final_resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Failed to generate final review: {e}")
+            final_review_text = final_context + f"\n\n[Final review generation failed, showing batch summaries]"
+
+        # Ensure minimum word count
         if len(final_review_text.split()) < MIN_REVIEW_WORDS:
             final_review_text += f"\n\n[Note: Review is shorter than {MIN_REVIEW_WORDS} words due to limited source material.]"
 
@@ -287,7 +358,6 @@ def generate_review_task(self, task_id):
         task.current_stage = None
         task.progress_percent = 100.0
         task.save()
-
         logger.info(f"Review generated successfully for task {task.id}")
 
     except Exception as exc:
