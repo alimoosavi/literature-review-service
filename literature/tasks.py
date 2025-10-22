@@ -24,11 +24,13 @@ PER_PAGE = 30
 MAX_PAGES = 5
 BATCH_SIZE = 6  # number of papers per batch
 
+
 # === Helper Functions ===
 def sanitize_text(text):
     if not text:
         return text
     return text.replace('\x00', '').replace('\u0000', '')
+
 
 def update_task_progress(task):
     if not task.total_papers_target or task.total_papers_target == 0:
@@ -61,6 +63,7 @@ def update_task_progress(task):
     task.progress_percent = min(progress, 99.0)
     task.save(update_fields=['progress_percent'])
 
+
 # === PDF Download ===
 def download_pdf(paper, pdf_dir):
     if not paper.pdf_url or paper.pdf_path:
@@ -79,6 +82,8 @@ def download_pdf(paper, pdf_dir):
         logger.warning(f"Failed to download PDF for {paper.title}: {e}")
     return False
 
+
+# === PDF Text Extraction ===
 def extract_text_from_pdf(paper):
     if not paper.pdf_path or paper.extracted_text:
         return False
@@ -95,6 +100,8 @@ def extract_text_from_pdf(paper):
         logger.warning(f"Failed to extract text for {paper.title}: {e}")
     return False
 
+
+# === Paper Summarization ===
 def summarize_paper(client, paper, task):
     if not paper.extracted_text or paper.summary:
         return False
@@ -115,10 +122,7 @@ def summarize_paper(client, paper, task):
             temperature=0.5
         )
         summary = resp.choices[0].message.content.strip()
-        if summary and len(summary) > 100:
-            paper.summary = sanitize_text(summary)
-        else:
-            paper.summary = "[Summary too short or invalid]"
+        paper.summary = sanitize_text(summary) if summary and len(summary) > 100 else "[Summary too short or invalid]"
         paper.save()
         return True
     except (RateLimitError, APIError) as e:
@@ -130,6 +134,7 @@ def summarize_paper(client, paper, task):
         paper.summary = "[Summary failed]"
         paper.save()
     return False
+
 
 # === Main Task ===
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
@@ -163,7 +168,6 @@ def generate_review_task(self, task_id):
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             papers_data = response.json().get('results', [])
-
             if not papers_data:
                 break
 
@@ -218,7 +222,7 @@ def generate_review_task(self, task_id):
                 task.save()
                 update_task_progress(task)
 
-        # === Step 4: Batch processing and structured final review ===
+        # === Step 4: Batch processing ===
         task.current_stage = 'generating_review'
         task.save()
         update_task_progress(task)
@@ -240,29 +244,30 @@ def generate_review_task(self, task_id):
             task.save()
             return
 
-        # Split papers into batches
         batches = [processed_papers[i:i + BATCH_SIZE] for i in range(0, len(processed_papers), BATCH_SIZE)]
         batch_summaries = []
 
         for idx, batch in enumerate(batches, start=1):
             batch_context = "\n\n".join(
-                [f"[{p['citation']}] {p['title']}\nAuthors: {', '.join(p['authors'])}\nYear: {p['year']}\nDOI: {p['doi']}\nSummary: {p['summary']}" for p in batch]
+                [
+                    f"[{p['citation']}] {p['title']}\nAuthors: {', '.join(p['authors'])}\nYear: {p['year']}\nDOI: {p['doi']}\nSummary: {p['summary']}"
+                    for p in batch]
             )
             batch_prompt = f"""
-            Generate a structured summary for this batch of papers (batch {idx} of {len(batches)}).
+Generate a structured summary for this batch of papers (batch {idx} of {len(batches)}).
 
-            User Request:
-            {task.prompt}
+User Request:
+{task.prompt}
 
-            Provided Papers:
-            {batch_context}
+Provided Papers:
+{batch_context}
 
-            Instructions:
-            - Include a synthesized summary for the batch.
-            - Maintain formal academic tone.
-            - Include inline citations.
-            - Preserve paper list with title, authors, year, DOI.
-            """
+Instructions:
+- Include a synthesized summary for the batch.
+- Maintain formal academic tone.
+- Include inline citations.
+- Preserve paper list with title, authors, year, DOI.
+"""
             try:
                 batch_resp = client.chat.completions.create(
                     model="gpt-4o",
@@ -270,13 +275,12 @@ def generate_review_task(self, task_id):
                     max_tokens=MAX_OPENAI_TOKENS,
                     temperature=0.7
                 )
-                batch_text = batch_resp.choices[0].message.content.strip()
-                batch_summaries.append(batch_text)
+                batch_summaries.append(batch_resp.choices[0].message.content.strip())
             except Exception as e:
                 logger.error(f"Failed to generate review for batch {idx}: {e}")
                 batch_summaries.append(f"[Batch {idx} failed to generate review]")
 
-        # Final aggregation step
+        # === Step 5: Final Aggregation using provided prompt ===
         final_context = "\n\n".join(batch_summaries)
         final_prompt = f"""
         You are tasked with generating a comprehensive, structured literature review from provided batch summaries of scientific papers.
@@ -329,10 +333,10 @@ def generate_review_task(self, task_id):
         - Include inline citations wherever necessary.
         - Produce at least {MIN_REVIEW_WORDS} words.
         - Conclude with a reference list of all papers used.
-        
+
         User Request:
         {task.prompt}
-        
+
         Batch Summaries:
         {final_context}
         """
@@ -349,7 +353,6 @@ def generate_review_task(self, task_id):
             logger.error(f"Failed to generate final review: {e}")
             final_review_text = final_context + f"\n\n[Final review generation failed, showing batch summaries]"
 
-        # Ensure minimum word count
         if len(final_review_text.split()) < MIN_REVIEW_WORDS:
             final_review_text += f"\n\n[Note: Review is shorter than {MIN_REVIEW_WORDS} words due to limited source material.]"
 
