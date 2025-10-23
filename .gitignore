@@ -2,6 +2,8 @@
 
 .env
 
+.docker.env
+
 media
 
 logs
